@@ -8,7 +8,16 @@ export interface NoteInfo {
   modified: Date;
 }
 
+export interface TemplateInfo {
+  name: string;       // display name without .md
+  path: string;       // vault-relative path
+}
+
 export class Vault {
+  private readonly TEMPLATES_DIR = 'Templates';
+  private readonly DAILY_DIR = 'daily';
+  private readonly DAILY_TEMPLATE = 'Templates/Daily Note Template.md';
+
   constructor(private readonly root: string) {
     if (!existsSync(root)) {
       throw new Error(`Vault path does not exist: ${root}`);
@@ -49,6 +58,31 @@ export class Vault {
     await fs.appendFile(abs, content, 'utf8');
   }
 
+  /**
+   * Prepend content to a note, inserting after the YAML frontmatter block if present.
+   * Creates the note if it doesn't exist.
+   */
+  async prepend(relPath: string, content: string): Promise<void> {
+    const abs = this.resolve(relPath);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+
+    if (!existsSync(abs)) {
+      await fs.writeFile(abs, content, 'utf8');
+      return;
+    }
+
+    const existing = await fs.readFile(abs, 'utf8');
+    // Detect and preserve frontmatter
+    const fmMatch = existing.match(/^---\n[\s\S]*?\n---\n/);
+    if (fmMatch) {
+      const fm = fmMatch[0];
+      const body = existing.slice(fm.length);
+      await fs.writeFile(abs, `${fm}\n${content}\n${body}`, 'utf8');
+    } else {
+      await fs.writeFile(abs, `${content}\n\n${existing}`, 'utf8');
+    }
+  }
+
   /** Delete a note. */
   async delete(relPath: string): Promise<void> {
     await fs.unlink(this.resolve(relPath));
@@ -70,62 +104,183 @@ export class Vault {
    * Returns vault-relative paths sorted alphabetically.
    */
   async list(globPattern = '**/*.md'): Promise<NoteInfo[]> {
-    const { glob } = await import('fs/promises');
     const matches: NoteInfo[] = [];
-
-    // Node 22+ has fs/promises glob
-    let files: string[];
-    try {
-      const iter = (glob as unknown as (pattern: string, opts: object) => AsyncIterable<string>)(
-        globPattern,
-        { cwd: this.root }
-      );
-      files = [];
-      for await (const f of iter) files.push(f);
-    } catch {
-      // Fallback: manual recursive walk if glob API unavailable
-      files = await this.walk(this.root, globPattern);
-    }
+    const files = await this.walk(this.root, globPattern);
 
     for (const relFile of files) {
-      // Skip .obsidian internals
       if (relFile.startsWith('.obsidian/') || relFile.startsWith('.obsidian\\')) continue;
       try {
         const stat = await fs.stat(path.join(this.root, relFile));
         matches.push({ path: relFile, size: stat.size, modified: stat.mtime });
-      } catch {
-        // File disappeared between glob and stat — skip
-      }
+      } catch { /* file disappeared */ }
     }
 
     return matches.sort((a, b) => a.path.localeCompare(b.path));
   }
 
-  /** Recursive directory walk, returns vault-relative paths ending in .md */
-  private async walk(dir: string, _pattern: string): Promise<string[]> {
-    const results: string[] = [];
-    const entries = await fs.readdir(dir, { withFileTypes: true });
-    for (const e of entries) {
-      if (e.name.startsWith('.')) continue;
-      const abs = path.join(dir, e.name);
-      const rel = path.relative(this.root, abs);
-      if (e.isDirectory()) {
-        results.push(...(await this.walk(abs, _pattern)));
-      } else if (e.name.endsWith('.md')) {
-        results.push(rel);
+  /** List all templates in the Templates/ folder. */
+  async listTemplates(): Promise<TemplateInfo[]> {
+    const templatesAbs = this.resolve(this.TEMPLATES_DIR);
+    if (!existsSync(templatesAbs)) return [];
+
+    const files = await this.walk(templatesAbs, '**/*.md');
+    return files.map(f => ({
+      name: f.replace(/\.md$/, ''),
+      path: path.join(this.TEMPLATES_DIR, f),
+    })).sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /**
+   * Render Obsidian template variables in content.
+   * Supports: {{date}}, {{date:FORMAT}}, {{time}}, {{time:FORMAT}}, {{title}},
+   * and any custom vars passed in the map.
+   */
+  renderTemplate(content: string, vars: Record<string, string> = {}): string {
+    const now = new Date();
+
+    return content.replace(/\{\{([^}]+)\}\}/g, (match, key) => {
+      const k = key.trim();
+
+      // Custom vars take priority
+      if (k in vars) return vars[k];
+
+      // Built-in: {{title}}
+      if (k === 'title') return vars.title ?? '';
+
+      // Built-in: {{date}} or {{date:FORMAT}}
+      if (k === 'date' || k.startsWith('date:')) {
+        const fmt = k.startsWith('date:') ? k.slice(5) : 'YYYY-MM-DD';
+        return formatDate(now, fmt);
       }
+
+      // Built-in: {{time}} or {{time:FORMAT}}
+      if (k === 'time' || k.startsWith('time:')) {
+        const fmt = k.startsWith('time:') ? k.slice(5) : 'HH:mm';
+        return formatDate(now, fmt);
+      }
+
+      // Unrecognised — leave as-is
+      return match;
+    });
+  }
+
+  /**
+   * Create a note from a named template.
+   * templateName: filename without .md, relative to Templates/
+   * notePath: vault-relative destination path
+   * vars: extra template variables (title is auto-derived from notePath if omitted)
+   */
+  async createFromTemplate(
+    templateName: string,
+    notePath: string,
+    vars: Record<string, string> = {},
+    overwrite = false
+  ): Promise<string> {
+    // Normalise template path
+    const tmplRel = templateName.endsWith('.md')
+      ? path.join(this.TEMPLATES_DIR, templateName)
+      : path.join(this.TEMPLATES_DIR, `${templateName}.md`);
+
+    if (!existsSync(this.resolve(tmplRel))) {
+      throw new Error(`Template not found: ${tmplRel}`);
     }
-    return results;
+
+    const raw = await this.read(tmplRel);
+    const title = vars.title ?? path.basename(notePath, '.md');
+    const rendered = this.renderTemplate(raw, { title, ...vars });
+    await this.write(notePath, rendered, overwrite);
+    return rendered;
+  }
+
+  /**
+   * Get vault-relative path for a daily note.
+   * Uses format: daily/YYYYMMDD.md (matching existing vault convention).
+   */
+  getDailyNotePath(date: Date = new Date()): string {
+    const d = formatDate(date, 'YYYYMMDD');
+    return `${this.DAILY_DIR}/${d}.md`;
+  }
+
+  /**
+   * Get or create today's daily note.
+   * Returns { path, content, created } — created=false if it already existed.
+   */
+  async getDailyNote(date: Date = new Date()): Promise<{ path: string; content: string; created: boolean }> {
+    const notePath = this.getDailyNotePath(date);
+    const abs = this.resolve(notePath);
+
+    if (existsSync(abs)) {
+      return { path: notePath, content: await this.read(notePath), created: false };
+    }
+
+    // Create from daily template if it exists
+    let content: string;
+    if (existsSync(this.resolve(this.DAILY_TEMPLATE))) {
+      content = await this.createFromTemplate('Daily Note Template', notePath, {
+        title: formatDate(date, 'YYYY-MM-DD'),
+        date: formatDate(date, 'YYYY-MM-DD'),
+      });
+    } else {
+      content = `---\ndate: ${formatDate(date, 'YYYY-MM-DD')}\n---\n\n`;
+      await this.write(notePath, content);
+    }
+
+    return { path: notePath, content, created: true };
+  }
+
+  /**
+   * Find all notes that contain a [[wikilink]] referencing the given note name.
+   * Returns vault-relative paths of notes that link to it.
+   */
+  async getBacklinks(noteName: string): Promise<string[]> {
+    const bare = path.basename(noteName, '.md');
+    // Match [[Note Name]] or [[Note Name|alias]] or [[folder/Note Name]]
+    const pattern = new RegExp(`\\[\\[([^\\]]*\\/)?${escapeRegex(bare)}(\\|[^\\]]*)?\\]\\]`, 'i');
+
+    const allNotes = await this.list();
+    const backlinks: string[] = [];
+
+    for (const note of allNotes) {
+      if (note.path === noteName) continue;
+      try {
+        const content = await this.read(note.path);
+        if (pattern.test(content)) backlinks.push(note.path);
+      } catch { /* unreadable — skip */ }
+    }
+
+    return backlinks.sort();
   }
 
   /**
    * Return a nested directory tree as a formatted string (like `tree`).
-   * maxDepth prevents runaway output on huge vaults.
    */
   async tree(maxDepth = 4): Promise<string> {
     const lines: string[] = [path.basename(this.root) + '/'];
     await this.treeDir(this.root, '', 0, maxDepth, lines);
     return lines.join('\n');
+  }
+
+  /** Recursive directory walk, returns paths relative to `dir` ending in .md */
+  private async walk(dir: string, _pattern: string): Promise<string[]> {
+    const results: string[] = [];
+    let entries: import('fs').Dirent[];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return results;
+    }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      const abs = path.join(dir, e.name);
+      const rel = path.relative(dir === this.root ? this.root : dir, abs);
+      if (e.isDirectory()) {
+        const sub = await this.walk(abs, _pattern);
+        results.push(...sub.map(s => path.join(e.name, s)));
+      } else if (e.name.endsWith('.md')) {
+        results.push(e.name);
+      }
+    }
+    return results;
   }
 
   private async treeDir(
@@ -148,7 +303,6 @@ export class Vault {
     entries = entries
       .filter(e => !e.name.startsWith('.'))
       .sort((a, b) => {
-        // Dirs first, then files
         if (a.isDirectory() && !b.isDirectory()) return -1;
         if (!a.isDirectory() && b.isDirectory()) return 1;
         return a.name.localeCompare(b.name);
@@ -169,4 +323,24 @@ export class Vault {
   get vaultRoot(): string {
     return this.root;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Format a Date using a simple subset of moment-style tokens. */
+function formatDate(d: Date, fmt: string): string {
+  const pad = (n: number, len = 2) => String(n).padStart(len, '0');
+  return fmt
+    .replace('YYYY', String(d.getFullYear()))
+    .replace('MM', pad(d.getMonth() + 1))
+    .replace('DD', pad(d.getDate()))
+    .replace('HH', pad(d.getHours()))
+    .replace('mm', pad(d.getMinutes()))
+    .replace('ss', pad(d.getSeconds()));
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
