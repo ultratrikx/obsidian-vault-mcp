@@ -20,6 +20,7 @@ const QMD_DB_PATH =
   new URL('../qmd-index/vault.db', import.meta.url).pathname;
 const MCP_PORT = parseInt(process.env.MCP_PORT ?? '3000', 10);
 const USE_HTTP = process.argv.includes('--http');
+const API_KEY = process.env.API_KEY ?? '';
 
 if (!VAULT_PATH) {
   process.stderr.write('ERROR: VAULT_PATH environment variable is required\n');
@@ -308,8 +309,21 @@ async function main() {
   // Transport
   // ---------------------------------------------------------------------------
   if (USE_HTTP) {
+    if (!API_KEY) {
+      process.stderr.write('[WARN] API_KEY is not set — HTTP server is unauthenticated\n');
+    }
+
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     const httpServer = createServer((req, res) => {
+      // Bearer token auth — only enforced when API_KEY is set
+      if (API_KEY) {
+        const authHeader = req.headers['authorization'] ?? '';
+        if (authHeader !== `Bearer ${API_KEY}`) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Unauthorized' }));
+          return;
+        }
+      }
       transport.handleRequest(req, res).catch(err => {
         res.writeHead(500);
         res.end(String(err));
