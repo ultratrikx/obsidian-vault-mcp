@@ -7,3 +7,4 @@ dist/
 qmd-index/
 .obsidian/
 *.log
+.claude/

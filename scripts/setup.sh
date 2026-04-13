@@ -1,75 +1,253 @@
 #!/usr/bin/env bash
-# One-time setup: install deps, build, install obsidian-headless, guide through login.
+# Unified setup for obsidian-vault-mcp.
+# Idempotent — safe to re-run at any time.
+#
+# Usage: sudo bash scripts/setup.sh
+#
+# What this does:
+#   1. npm install + build
+#   2. Install obsidian-headless (Obsidian Sync CLI)
+#   3. Install + configure Cloudflare Tunnel (cloudflared)
+#   4. Install systemd services for MCP server + Obsidian sync
+#   5. Enable + start everything
+
 set -euo pipefail
+
+# Must run as root for systemd
+if [[ $EUID -ne 0 ]]; then
+  echo "Run with sudo: sudo bash scripts/setup.sh"
+  exit 1
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo clanker)}"
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 
-echo "=== obsidian-vault-mcp setup ==="
-
-# 1. Copy .env if missing
+# ---------------------------------------------------------------------------
+# Load .env
+# ---------------------------------------------------------------------------
 if [[ ! -f "$ROOT_DIR/.env" ]]; then
-  cp "$ROOT_DIR/.env.example" "$ROOT_DIR/.env"
-  echo "Created .env from .env.example — edit VAULT_PATH before continuing."
-  echo "  nano $ROOT_DIR/.env"
+  echo "ERROR: $ROOT_DIR/.env not found."
   exit 1
 fi
 
+set -a
+# shellcheck disable=SC1091
 source "$ROOT_DIR/.env"
+set +a
 
 if [[ -z "${VAULT_PATH:-}" ]]; then
-  echo "ERROR: Set VAULT_PATH in $ROOT_DIR/.env"
+  echo "ERROR: VAULT_PATH not set in .env"
   exit 1
 fi
 
-# 2. Install project dependencies
-echo ""
-echo "Installing project dependencies..."
-cd "$ROOT_DIR" && npm install
+NODE_BIN=$(su - "$REAL_USER" -c 'command -v node' 2>/dev/null || true)
+NPM_BIN=$(su - "$REAL_USER" -c 'command -v npm' 2>/dev/null || true)
 
-# 3. Build
-echo ""
-echo "Building TypeScript..."
-npm run build
-
-# 4. Install obsidian-headless globally
-if ! command -v ob &>/dev/null; then
-  echo ""
-  echo "Installing obsidian-headless globally..."
-  npm install -g obsidian-headless
+if [[ -z "$NODE_BIN" ]]; then
+  echo "ERROR: node not found for user $REAL_USER"
+  exit 1
 fi
 
-# 5. Login prompt
+NODE_DIR=$(dirname "$NODE_BIN")
+echo "Using node: $NODE_BIN"
+
+# ---------------------------------------------------------------------------
+# 1. Install deps + build
+# ---------------------------------------------------------------------------
 echo ""
-echo "=== Obsidian Sync setup ==="
-if ob sync-list-remote &>/dev/null 2>&1; then
-  echo "Already logged in to Obsidian Sync."
+echo "=== Installing dependencies ==="
+su - "$REAL_USER" -c "cd '$ROOT_DIR' && npm install"
+echo "=== Building ==="
+su - "$REAL_USER" -c "cd '$ROOT_DIR' && npm run build"
+
+# ---------------------------------------------------------------------------
+# 2. Install obsidian-headless
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== obsidian-headless ==="
+if ! su - "$REAL_USER" -c 'command -v ob' &>/dev/null; then
+  su - "$REAL_USER" -c "npm install -g obsidian-headless"
+  echo "Installed obsidian-headless."
 else
-  echo "Run the following to authenticate:"
-  echo "  ob login"
+  echo "obsidian-headless already installed."
 fi
 
+OB_BIN=$(su - "$REAL_USER" -c 'command -v ob')
+
+# ---------------------------------------------------------------------------
+# 3. Install cloudflared
+# ---------------------------------------------------------------------------
 echo ""
-echo "Once logged in, set up your vault sync:"
-echo "  mkdir -p $VAULT_PATH"
-echo "  ob sync-setup $VAULT_PATH"
+echo "=== cloudflared ==="
+if ! command -v cloudflared &>/dev/null; then
+  curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+    | tee /usr/share/keyrings/cloudflare-main.gpg > /dev/null
+  echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" \
+    | tee /etc/apt/sources.list.d/cloudflared.list
+  apt-get update -qq && apt-get install -y cloudflared
+  echo "cloudflared installed."
+else
+  echo "cloudflared already installed: $(cloudflared --version)"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Cloudflare tunnel config
+# ---------------------------------------------------------------------------
 echo ""
-echo "Then start both services:"
-echo "  ./scripts/start-sync.sh    # background sync"
-echo "  ./scripts/start-mcp.sh     # MCP server"
+echo "=== Cloudflare tunnel ==="
+TUNNEL_NAME="obsidian-mcp"
+DOMAIN="${DOMAIN:-mcp.rohanthmaremservers.xyz}"
+MCP_PORT="${MCP_PORT:-3000}"
+
+# Login if not already authenticated
+if [[ ! -f "$REAL_HOME/.cloudflared/cert.pem" ]]; then
+  echo "Not logged in to Cloudflare. Run this as $REAL_USER:"
+  echo "  cloudflared tunnel login"
+  echo "Then re-run this script."
+  exit 1
+fi
+
+# Create tunnel if needed
+if ! su - "$REAL_USER" -c "cloudflared tunnel list 2>/dev/null" | grep -q "$TUNNEL_NAME"; then
+  su - "$REAL_USER" -c "cloudflared tunnel create $TUNNEL_NAME"
+fi
+
+TUNNEL_ID=$(su - "$REAL_USER" -c "cloudflared tunnel list --output json 2>/dev/null" \
+  | python3 -c "import sys,json; ts=json.load(sys.stdin); print(next(t['id'] for t in ts if t['name']=='$TUNNEL_NAME'))")
+
+# Write cloudflared config
+mkdir -p /etc/cloudflared
+tee /etc/cloudflared/config.yml > /dev/null <<YAML
+tunnel: $TUNNEL_ID
+credentials-file: $REAL_HOME/.cloudflared/$TUNNEL_ID.json
+
+ingress:
+  - hostname: $DOMAIN
+    service: http://localhost:$MCP_PORT
+  - service: http_status:404
+YAML
+echo "Cloudflared config written (tunnel: $TUNNEL_ID)"
+
+# DNS CNAME
+su - "$REAL_USER" -c "cloudflared tunnel route dns $TUNNEL_NAME $DOMAIN" 2>&1 \
+  | grep -v "already exists" || true
+
+# ---------------------------------------------------------------------------
+# 5. Generate API_KEY if missing
+# ---------------------------------------------------------------------------
+if [[ -z "${API_KEY:-}" ]]; then
+  API_KEY="$(openssl rand -hex 32)"
+  if grep -q "^API_KEY=" "$ROOT_DIR/.env"; then
+    sed -i "s|^API_KEY=.*|API_KEY=$API_KEY|" "$ROOT_DIR/.env"
+  else
+    echo "API_KEY=$API_KEY" >> "$ROOT_DIR/.env"
+  fi
+  echo "Generated API_KEY and saved to .env"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. systemd: cloudflared
+# ---------------------------------------------------------------------------
 echo ""
-echo "=== Claude Desktop config snippet ==="
+echo "=== systemd: cloudflared ==="
+if ! systemctl is-active cloudflared &>/dev/null; then
+  cloudflared service install
+fi
+systemctl enable cloudflared
+systemctl restart cloudflared
+echo "cloudflared: $(systemctl is-active cloudflared)"
+
+# ---------------------------------------------------------------------------
+# 7. systemd: obsidian-mcp
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== systemd: obsidian-mcp ==="
+tee /etc/systemd/system/obsidian-mcp.service > /dev/null <<SERVICE
+[Unit]
+Description=Obsidian Vault MCP Server
+After=network.target cloudflared.service
+
+[Service]
+User=$REAL_USER
+WorkingDirectory=$ROOT_DIR
+Environment=PATH=$NODE_DIR:/usr/local/bin:/usr/bin:/bin
+ExecStart=$NODE_BIN --env-file=.env dist/server.js --http
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable obsidian-mcp
+systemctl restart obsidian-mcp
+sleep 2
+echo "obsidian-mcp: $(systemctl is-active obsidian-mcp)"
+
+# ---------------------------------------------------------------------------
+# 8. systemd: obsidian-sync (obsidian-headless continuous sync)
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== systemd: obsidian-sync ==="
+
+# Only install if ob is authenticated
+if su - "$REAL_USER" -c "$OB_BIN sync-list-remote" &>/dev/null 2>&1; then
+  mkdir -p "$VAULT_PATH"
+  chown "$REAL_USER":"$REAL_USER" "$VAULT_PATH"
+
+  tee /etc/systemd/system/obsidian-sync.service > /dev/null <<SERVICE
+[Unit]
+Description=Obsidian Vault Sync (obsidian-headless)
+After=network.target
+
+[Service]
+User=$REAL_USER
+WorkingDirectory=$REAL_HOME
+Environment=PATH=$NODE_DIR:/usr/local/bin:/usr/bin:/bin
+ExecStart=$OB_BIN sync '$VAULT_PATH' --continuous
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+  systemctl daemon-reload
+  systemctl enable obsidian-sync
+  systemctl restart obsidian-sync
+  sleep 2
+  echo "obsidian-sync: $(systemctl is-active obsidian-sync)"
+else
+  echo "Skipped (ob not logged in). To set up sync later:"
+  echo "  ob login"
+  echo "  ob sync-setup $VAULT_PATH"
+  echo "  sudo systemctl start obsidian-sync"
+fi
+
+# ---------------------------------------------------------------------------
+# Done
+# ---------------------------------------------------------------------------
+echo ""
+echo "=============================="
+echo " Setup complete"
+echo "=============================="
+echo ""
+echo "Services:"
+systemctl is-active obsidian-mcp    && echo "  ✓ obsidian-mcp" || echo "  ✗ obsidian-mcp (check: journalctl -u obsidian-mcp)"
+systemctl is-active cloudflared     && echo "  ✓ cloudflared"  || echo "  ✗ cloudflared"
+systemctl is-active obsidian-sync 2>/dev/null && echo "  ✓ obsidian-sync" || true
+echo ""
+echo "MCP endpoint: https://$DOMAIN"
+echo ""
+echo "MCP client config:"
+echo "  URL: https://$DOMAIN/?token=$API_KEY"
+echo ""
+echo "Or with Authorization header:"
 cat <<JSON
 {
-  "mcpServers": {
-    "obsidian": {
-      "command": "node",
-      "args": ["$ROOT_DIR/dist/server.js"],
-      "env": {
-        "VAULT_PATH": "$VAULT_PATH",
-        "QMD_DB_PATH": "$ROOT_DIR/qmd-index/vault.db"
-      }
-    }
-  }
+  "url": "https://$DOMAIN/?token=$API_KEY"
 }
 JSON
