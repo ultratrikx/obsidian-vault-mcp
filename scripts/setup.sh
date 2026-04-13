@@ -193,21 +193,19 @@ echo "obsidian-mcp: $(systemctl is-active obsidian-mcp)"
 echo ""
 echo "=== systemd: obsidian-sync ==="
 
-# Only install if ob is authenticated
-if su - "$REAL_USER" -c "$OB_BIN sync-list-remote" &>/dev/null 2>&1; then
-  mkdir -p "$VAULT_PATH"
-  chown "$REAL_USER":"$REAL_USER" "$VAULT_PATH"
+mkdir -p "$VAULT_PATH"
+chown "$REAL_USER":"$REAL_USER" "$VAULT_PATH"
 
-  tee /etc/systemd/system/obsidian-sync.service > /dev/null <<SERVICE
+tee /etc/systemd/system/obsidian-sync.service > /dev/null <<SERVICE
 [Unit]
 Description=Obsidian Vault Sync (obsidian-headless)
 After=network.target
 
 [Service]
 User=$REAL_USER
-WorkingDirectory=$REAL_HOME
+WorkingDirectory=$VAULT_PATH
 Environment=PATH=$NODE_DIR:/usr/local/bin:/usr/bin:/bin
-ExecStart=$OB_BIN sync '$VAULT_PATH' --continuous
+ExecStart=$OB_BIN sync $VAULT_PATH --continuous
 Restart=on-failure
 RestartSec=10
 
@@ -215,16 +213,19 @@ RestartSec=10
 WantedBy=multi-user.target
 SERVICE
 
-  systemctl daemon-reload
-  systemctl enable obsidian-sync
-  systemctl restart obsidian-sync
-  sleep 2
-  echo "obsidian-sync: $(systemctl is-active obsidian-sync)"
-else
-  echo "Skipped (ob not logged in). To set up sync later:"
-  echo "  ob login"
-  echo "  ob sync-setup $VAULT_PATH"
-  echo "  sudo systemctl start obsidian-sync"
+systemctl daemon-reload
+systemctl enable obsidian-sync
+systemctl restart obsidian-sync
+sleep 2
+
+SYNC_STATUS=$(systemctl is-active obsidian-sync)
+echo "obsidian-sync: $SYNC_STATUS"
+if [[ "$SYNC_STATUS" != "active" ]]; then
+  echo ""
+  echo "  obsidian-sync failed to start. If ob is not yet authenticated, run:"
+  echo "    su - $REAL_USER -c 'ob login'"
+  echo "    su - $REAL_USER -c 'ob sync-setup $VAULT_PATH'"
+  echo "  Then: sudo systemctl start obsidian-sync"
 fi
 
 # ---------------------------------------------------------------------------
@@ -238,7 +239,7 @@ echo ""
 echo "Services:"
 systemctl is-active obsidian-mcp    && echo "  ✓ obsidian-mcp" || echo "  ✗ obsidian-mcp (check: journalctl -u obsidian-mcp)"
 systemctl is-active cloudflared     && echo "  ✓ cloudflared"  || echo "  ✗ cloudflared"
-systemctl is-active obsidian-sync 2>/dev/null && echo "  ✓ obsidian-sync" || true
+systemctl is-active obsidian-sync 2>/dev/null && echo "  ✓ obsidian-sync" || echo "  ✗ obsidian-sync (check: journalctl -u obsidian-sync)"
 echo ""
 echo "MCP endpoint: https://$DOMAIN"
 echo ""
