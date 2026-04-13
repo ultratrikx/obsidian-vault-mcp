@@ -324,9 +324,25 @@ async function main() {
           return;
         }
       }
-      transport.handleRequest(req, res).catch(err => {
-        res.writeHead(500);
-        res.end(String(err));
+
+      // Read and parse body before passing to transport (required by MCP SDK)
+      const chunks: Buffer[] = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        let parsedBody: unknown;
+        if (chunks.length > 0) {
+          try {
+            parsedBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          } catch {
+            // Non-JSON body (e.g. GET requests) — pass undefined
+          }
+        }
+        transport.handleRequest(req, res, parsedBody).catch(err => {
+          if (!res.headersSent) {
+            res.writeHead(500);
+            res.end(String(err));
+          }
+        });
       });
     });
     await server.connect(transport);
