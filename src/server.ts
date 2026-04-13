@@ -315,10 +315,14 @@ async function main() {
 
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     const httpServer = createServer((req, res) => {
-      // Bearer token auth — only enforced when API_KEY is set
+      // Auth: accept Bearer token in Authorization header OR ?token= query param
       if (API_KEY) {
         const authHeader = req.headers['authorization'] ?? '';
-        if (authHeader !== `Bearer ${API_KEY}`) {
+        const url = new URL(req.url ?? '/', `http://localhost`);
+        const queryToken = url.searchParams.get('token') ?? '';
+        const validHeader = authHeader === `Bearer ${API_KEY}`;
+        const validQuery = queryToken === API_KEY;
+        if (!validHeader && !validQuery) {
           res.writeHead(401, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Unauthorized' }));
           return;
