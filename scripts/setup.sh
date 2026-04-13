@@ -205,7 +205,7 @@ After=network.target
 User=$REAL_USER
 WorkingDirectory=$VAULT_PATH
 Environment=PATH=$NODE_DIR:/usr/local/bin:/usr/bin:/bin
-ExecStart=$OB_BIN sync $VAULT_PATH --continuous
+ExecStart=$OB_BIN sync --continuous
 Restart=on-failure
 RestartSec=10
 
@@ -224,7 +224,7 @@ if [[ "$SYNC_STATUS" != "active" ]]; then
   echo ""
   echo "  obsidian-sync failed to start. If ob is not yet authenticated, run:"
   echo "    su - $REAL_USER -c 'ob login'"
-  echo "    su - $REAL_USER -c 'ob sync-setup $VAULT_PATH'"
+  echo "    su - $REAL_USER -c 'cd $VAULT_PATH && ob sync-setup'"
   echo "  Then: sudo systemctl start obsidian-sync"
 fi
 
