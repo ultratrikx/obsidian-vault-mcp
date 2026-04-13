@@ -94,8 +94,22 @@ cloudflared tunnel route dns "$TUNNEL_NAME" "$DOMAIN" 2>&1 || \
 
 # ---------------------------------------------------------------------------
 # 6. Install as systemd service
+# cloudflared service install needs the config in /etc/cloudflared/
 # ---------------------------------------------------------------------------
 echo "Installing as systemd service..."
+sudo mkdir -p /etc/cloudflared
+
+# Write config with absolute paths (no ~ expansion under sudo)
+sudo tee /etc/cloudflared/config.yml > /dev/null <<YAML
+tunnel: $TUNNEL_ID
+credentials-file: /home/$USER/.cloudflared/$TUNNEL_ID.json
+
+ingress:
+  - hostname: $DOMAIN
+    service: http://localhost:$MCP_PORT
+  - service: http_status:404
+YAML
+
 sudo cloudflared service install
 sudo systemctl enable cloudflared
 sudo systemctl restart cloudflared
