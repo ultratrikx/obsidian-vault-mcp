@@ -34,7 +34,7 @@ fi
 
 echo "Starting MCP server (${HTTP_FLAG:-stdio} mode)..."
 tmux new-session -d -s "$SESSION" \
-  "cd '$ROOT_DIR' && node dist/server.js $HTTP_FLAG 2>&1 | tee -a '$ROOT_DIR/mcp.log'"
+  "cd '$ROOT_DIR' && node --env-file=.env dist/server.js $HTTP_FLAG 2>&1 | tee -a '$ROOT_DIR/mcp.log'"
 
 echo "Started. Session: $SESSION"
 echo "  tmux attach -t $SESSION"
