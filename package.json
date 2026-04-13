@@ -1,0 +1,28 @@
+{
+  "name": "obsidian-vault-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Obsidian vault with QMD-powered semantic search",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "start:http": "node dist/server.js --http",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@tobilu/qmd": "^2.1.0",
+    "chokidar": "^4.0.3",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

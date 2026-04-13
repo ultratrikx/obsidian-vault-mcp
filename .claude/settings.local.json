@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "Bash(gh repo:*)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(d.get\\('description',''\\)\\); print\\(d.get\\('url',''\\)\\); readme=d.get\\('readme',{}\\); print\\(readme.get\\('text',''\\)[:3000] if readme else 'no readme'\\)\")",
+      "Bash(bun --version)"
+    ]
+  }
+}
