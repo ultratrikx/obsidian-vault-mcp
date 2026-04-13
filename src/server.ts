@@ -185,26 +185,16 @@ const MoveNoteInput = z.object({
 });
 
 // ---------------------------------------------------------------------------
-// Main
+// MCP server factory — must be called fresh per HTTP request (stateless mode)
 // ---------------------------------------------------------------------------
-async function main() {
-  const vault = new Vault(VAULT_PATH!);
-  const search = new VaultSearch(VAULT_PATH!, QMD_DB_PATH);
-
-  // Init search index (non-blocking — server starts immediately)
-  search.init().catch(err => {
-    process.stderr.write(`[WARN] Search init error: ${err}\n`);
-  });
-
+function makeMCPServer(vault: Vault, search: VaultSearch): Server {
   const server = new Server(
     { name: 'obsidian-vault-mcp', version: '1.0.0' },
     { capabilities: { tools: {} } }
   );
 
-  // List tools
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-  // Call tool
   server.setRequestHandler(CallToolRequestSchema, async req => {
     const { name, arguments: args } = req.params;
 
@@ -305,6 +295,21 @@ async function main() {
     }
   });
 
+  return server;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+async function main() {
+  const vault = new Vault(VAULT_PATH!);
+  const search = new VaultSearch(VAULT_PATH!, QMD_DB_PATH);
+
+  // Init search index (non-blocking — server starts immediately)
+  search.init().catch(err => {
+    process.stderr.write(`[WARN] Search init error: ${err}\n`);
+  });
+
   // ---------------------------------------------------------------------------
   // Transport
   // ---------------------------------------------------------------------------
@@ -313,7 +318,6 @@ async function main() {
       process.stderr.write('[WARN] API_KEY is not set — HTTP server is unauthenticated\n');
     }
 
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     const httpServer = createServer((req, res) => {
       // Auth: accept Bearer token in Authorization header OR ?token= query param
       if (API_KEY) {
@@ -329,7 +333,11 @@ async function main() {
         }
       }
 
-      // Read and parse body before passing to transport (required by MCP SDK)
+      // Fresh server + transport per request — required by MCP SDK stateless mode.
+      // (Stateless transport throws if reused; Server throws if connected twice.)
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      const server = makeMCPServer(vault, search);
+
       const chunks: Buffer[] = [];
       req.on('data', chunk => chunks.push(chunk));
       req.on('end', () => {
@@ -341,15 +349,17 @@ async function main() {
             // Non-JSON body (e.g. GET requests) — pass undefined
           }
         }
-        transport.handleRequest(req, res, parsedBody).catch(err => {
-          if (!res.headersSent) {
-            res.writeHead(500);
-            res.end(String(err));
-          }
-        });
+        server.connect(transport)
+          .then(() => transport.handleRequest(req, res, parsedBody))
+          .catch(err => {
+            if (!res.headersSent) {
+              res.writeHead(500);
+              res.end(String(err));
+            }
+          });
       });
     });
-    await server.connect(transport);
+
     httpServer.listen(MCP_PORT, () => {
       process.stderr.write(`[INFO] MCP HTTP server listening on port ${MCP_PORT}\n`);
     });
@@ -361,6 +371,7 @@ async function main() {
     });
   } else {
     const transport = new StdioServerTransport();
+    const server = makeMCPServer(vault, search);
     await server.connect(transport);
     process.stderr.write('[INFO] MCP stdio server started\n');
 
