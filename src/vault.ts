@@ -8,6 +8,54 @@ export interface NoteInfo {
   modified: Date;
 }
 
+export type FrontmatterValue = string | number | boolean | string[];
+
+/** Builds a YAML frontmatter block from a key-value map. */
+export function buildFrontmatter(fields: Record<string, FrontmatterValue>): string {
+  const lines = ['---'];
+  for (const [k, v] of Object.entries(fields)) {
+    if (Array.isArray(v)) {
+      lines.push(`${k}:`);
+      for (const item of v) lines.push(`  - ${item}`);
+    } else {
+      lines.push(`${k}: ${v}`);
+    }
+  }
+  lines.push('---');
+  return lines.join('\n');
+}
+
+/** Extract the frontmatter block + remainder from a note's content. */
+export function parseFrontmatter(content: string): {
+  fields: Record<string, string>;
+  body: string;
+  raw: string; // the full ---...--- block including delimiters
+} {
+  const match = content.match(/^---\n([\s\S]*?)\n---\n?/);
+  if (!match) return { fields: {}, body: content, raw: '' };
+
+  const fields: Record<string, string> = {};
+  for (const line of match[1].split('\n')) {
+    const idx = line.indexOf(':');
+    if (idx === -1) continue;
+    const key = line.slice(0, idx).trim();
+    const val = line.slice(idx + 1).trim();
+    if (key) fields[key] = val;
+  }
+  return { fields, body: content.slice(match[0].length), raw: match[0] };
+}
+
+/** Inject / merge frontmatter into content. Replaces existing block if present. */
+export function injectFrontmatter(
+  content: string,
+  extra: Record<string, FrontmatterValue>
+): string {
+  const { fields, body } = parseFrontmatter(content);
+  // extra fields take priority, existing fields fill in gaps
+  const merged = { ...fields, ...extra };
+  return `${buildFrontmatter(merged)}\n${body}`;
+}
+
 export interface TemplateInfo {
   name: string;       // display name without .md
   path: string;       // vault-relative path
@@ -51,11 +99,87 @@ export class Vault {
     await fs.writeFile(abs, content, 'utf8');
   }
 
-  /** Append text to an existing note (creates it if missing). */
+  /**
+   * Create or overwrite a note with structured frontmatter.
+   * - frontmatter: key-value pairs auto-serialised to YAML
+   * - Auto-stamps `created` (new notes only) and `modified` (always) if not provided
+   * - fileModifiedAt: if given, sets the filesystem mtime via utimes()
+   */
+  async writeNote(
+    relPath: string,
+    body: string,
+    options: {
+      frontmatter?: Record<string, FrontmatterValue>;
+      overwrite?: boolean;
+      fileModifiedAt?: Date;
+    } = {}
+  ): Promise<void> {
+    const abs = this.resolve(relPath);
+    const { overwrite = false, fileModifiedAt } = options;
+
+    if (!overwrite && existsSync(abs)) {
+      throw new Error(`Note already exists: ${relPath}. Set overwrite=true to replace.`);
+    }
+
+    const now = new Date();
+    const nowStr = isoLocal(now);
+    const isNew = !existsSync(abs);
+
+    // Build frontmatter: user fields take priority, auto-stamps fill gaps
+    const fm: Record<string, FrontmatterValue> = { ...options.frontmatter };
+    if (!('created' in fm) && isNew) fm.created = nowStr;
+    if (!('modified' in fm)) fm.modified = nowStr;
+
+    const content = `${buildFrontmatter(fm)}\n\n${body}`;
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, content, 'utf8');
+
+    // Stamp filesystem mtime if requested
+    if (fileModifiedAt) {
+      await fs.utimes(abs, fileModifiedAt, fileModifiedAt);
+    }
+  }
+
+  /**
+   * Append text to an existing note (creates it if missing).
+   * Automatically updates the `modified` field in frontmatter if present.
+   */
   async append(relPath: string, content: string): Promise<void> {
     const abs = this.resolve(relPath);
     await fs.mkdir(path.dirname(abs), { recursive: true });
     await fs.appendFile(abs, content, 'utf8');
+    await this.touchModified(abs);
+  }
+
+  /**
+   * Set the filesystem mtime (and optionally update the `modified` frontmatter field)
+   * on an existing note. Useful for backdating or syncing timestamps.
+   */
+  async touchNote(
+    relPath: string,
+    options: { date?: Date; updateFrontmatter?: boolean } = {}
+  ): Promise<void> {
+    const abs = this.resolve(relPath);
+    if (!existsSync(abs)) throw new Error(`Note not found: ${relPath}`);
+    const d = options.date ?? new Date();
+    await fs.utimes(abs, d, d);
+    if (options.updateFrontmatter !== false) {
+      await this.touchModified(abs, d);
+    }
+  }
+
+  /** Update the `modified` field in a note's frontmatter (internal helper). */
+  private async touchModified(abs: string, date: Date = new Date()): Promise<void> {
+    try {
+      const existing = await fs.readFile(abs, 'utf8');
+      const { raw } = parseFrontmatter(existing);
+      if (!raw) return; // no frontmatter — nothing to update
+      const updated = existing.replace(
+        /^(modified:\s*).*$/m,
+        `$1${isoLocal(date)}`
+      );
+      if (updated !== existing) await fs.writeFile(abs, updated, 'utf8');
+    } catch { /* best-effort */ }
   }
 
   /**
@@ -343,4 +467,9 @@ function formatDate(d: Date, fmt: string): string {
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** ISO-8601 local time string (no Z suffix — matches Obsidian's convention). */
+function isoLocal(d: Date): string {
+  return formatDate(d, 'YYYY-MM-DD') + 'T' + formatDate(d, 'HH:mm:ss');
 }

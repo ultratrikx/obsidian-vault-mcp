@@ -8,7 +8,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { createServer } from 'http';
 import { z } from 'zod';
-import { Vault } from './vault.js';
+import { Vault, type FrontmatterValue } from './vault.js';
 import { VaultSearch } from './search.js';
 
 // ---------------------------------------------------------------------------
@@ -139,15 +139,37 @@ const TOOLS = [
   // --- Note writing ---
   {
     name: 'create_note',
-    description: 'Create a new note with given content.',
+    description: 'Create a new note with optional structured frontmatter. Auto-stamps `created` and `modified` in the frontmatter and can set the filesystem mtime. Use `frontmatter` to pass any metadata fields (tags, aliases, date, etc.).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Vault-relative path (e.g. "folder/note.md")' },
+        content: { type: 'string', description: 'Note body (markdown, without frontmatter)' },
+        frontmatter: {
+          type: 'object',
+          description: 'YAML frontmatter fields. `created` and `modified` are auto-stamped if omitted.',
+          additionalProperties: true,
+        },
+        file_modified_at: {
+          type: 'string',
+          description: 'ISO-8601 datetime to set as the filesystem mtime (e.g. "2024-01-15T09:00:00")',
+        },
+        overwrite: { type: 'boolean', default: false },
+      },
+      required: ['path', 'content'],
+    },
+  },
+  {
+    name: 'touch_note',
+    description: 'Set the filesystem modification time of a note and update the `modified` frontmatter field. Use this to backdate or sync a note\'s timestamps.',
     inputSchema: {
       type: 'object',
       properties: {
         path: { type: 'string' },
-        content: { type: 'string' },
-        overwrite: { type: 'boolean', default: false },
+        date: { type: 'string', description: 'ISO-8601 datetime (default: now)' },
+        update_frontmatter: { type: 'boolean', description: 'Also update `modified` in frontmatter (default: true)', default: true },
       },
-      required: ['path', 'content'],
+      required: ['path'],
     },
   },
   {
@@ -286,11 +308,18 @@ const TreeInput = z.object({ max_depth: z.number().min(1).max(10).default(4) });
 const CreateNoteInput = z.object({
   path: z.string(),
   content: z.string(),
+  frontmatter: z.record(z.unknown()).optional(),
+  file_modified_at: z.string().optional(),
   overwrite: z.boolean().default(false),
 });
 const AppendInput = z.object({ path: z.string(), content: z.string() });
 const PrependInput = z.object({ path: z.string(), content: z.string() });
 const UpdateNoteInput = z.object({ path: z.string(), content: z.string() });
+const TouchNoteInput = z.object({
+  path: z.string(),
+  date: z.string().optional(),
+  update_frontmatter: z.boolean().default(true),
+});
 const DeleteNoteInput = z.object({ path: z.string() });
 const MoveNoteInput = z.object({
   from: z.string(),
@@ -413,9 +442,26 @@ function makeMCPServer(vault: Vault, search: VaultSearch): Server {
 
         // --- Note writing ---
         case 'create_note': {
-          const { path, content, overwrite } = CreateNoteInput.parse(args);
-          await vault.write(path, content, overwrite);
+          const { path, content, frontmatter, file_modified_at, overwrite } = CreateNoteInput.parse(args);
+          if (frontmatter || file_modified_at) {
+            await vault.writeNote(path, content, {
+              frontmatter: frontmatter as Record<string, FrontmatterValue> | undefined,
+              overwrite,
+              fileModifiedAt: file_modified_at ? new Date(file_modified_at) : undefined,
+            });
+          } else {
+            await vault.write(path, content, overwrite);
+          }
           return { content: [{ type: 'text', text: `Created: ${path}` }] };
+        }
+
+        case 'touch_note': {
+          const { path, date, update_frontmatter } = TouchNoteInput.parse(args);
+          await vault.touchNote(path, {
+            date: date ? new Date(date) : undefined,
+            updateFrontmatter: update_frontmatter,
+          });
+          return { content: [{ type: 'text', text: `Touched: ${path}` }] };
         }
 
         case 'append_to_note': {
